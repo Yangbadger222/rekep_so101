@@ -1,0 +1,106 @@
+# AGENT CONSTRAINTS — Rekep × SO-101 项目
+
+> 本文件是项目级强约束。任何接手本仓库的 agent **必须**在动手前完整阅读本文件
+> 与 `docs/HANDOFF.md`、`docs/SO101_OMNIGIBSON_REKEP_PLAN.md`，否则禁止改动代码。
+
+------------------------------------------------------------
+## 0. 必读文档（按顺序）
+1. `docs/SO101_OMNIGIBSON_REKEP_PLAN.md` —— 总体方案
+2. `docs/HANDOFF.md`                      —— 上一位 agent 的最新交接状态
+3. `README.md`                            —— ReKep 原始说明
+4. 本文件 `.agent`                         —— 强制约束
+
+------------------------------------------------------------
+## 1. 工作范围与边界
+- 目标：把 SO-101 接入 OmniGibson + ReKep，实现"桌面清理垃圾"任务。
+- 资产目录：`assert/SO101/`（**不要改名为 assets**，会破坏 USD 内部引用与 git 历史）。
+- 不要重写 ReKep 核心算法（subgoal_solver / path_solver / keypoint_proposer 的算法层不动）。
+- 接口适配集中在 `environment.py` / `main.py` / `ik_solver.py` / `configs/config.yaml`。
+- **不要**提交大文件（>50 MB），不要把 `videos/`、`vlm_query/<timestamp>_*` 推到 git。
+
+------------------------------------------------------------
+## 2. 写代码前的强制流程
+1. `git status` 确认干净起点；如有未提交改动，先在 `docs/HANDOFF.md` "Open Issues" 里记录。
+2. 阅读"必读文档"。
+3. 在 `docs/HANDOFF.md` 顶部 "In Progress" 区写下：你打算改什么 / 为什么 / 预期影响范围。
+4. 最小改动原则：一次只改一个里程碑（M1–M7）相关的文件。
+5. 优先用调试脚本（`scripts/m*_*.py`）验证，不要直接改 main.py 全链跑。
+
+------------------------------------------------------------
+## 3. 验证强制要求（NON-NEGOTIABLE）
+任何一次代码改动 **必须** 通过以下验证才能视为完成：
+
+### 3.1 语法 / 静态检查
+- `python -m py_compile <changed.py>` 必须无错。
+- 如果改动涉及 yaml/json，用 `python -c "import yaml,json,sys;yaml.safe_load(open(...))"` 解析通过。
+
+### 3.2 里程碑级 smoke test
+| 改动涉及 | 必跑脚本 | 通过标准 |
+|----------|----------|----------|
+| USD/资产 | `scripts/m1_open_usd.py` | 1000 step 不爆炸 |
+| 桌面/物体 | `scripts/m3_table_trash_bin.py` | 物理稳定 |
+| Lula yaml / IKSolver | `scripts/m4_test_ik.py` | IK 成功率 ≥ 80% |
+| SO101 robot 子类 | `scripts/m5_test_so101_robot.py` | 全部 5 关节可动 + gripper 开合 |
+| ReKep 接口 | `python main.py --task trash --use_cached_query` | 不报 AttributeError，至少完成 1 个 stage |
+
+### 3.3 端到端
+- 完成 M7 时，必须录到 `videos/<timestamp>.mp4` 且满足
+  `docs/SO101_OMNIGIBSON_REKEP_PLAN.md` 里"端到端 Demo 标准"的 5 条目。
+
+### 3.4 禁止行为
+- ❌ 禁止用 hardcode 让测试通过（例如 mock IK 结果）。
+- ❌ 禁止禁用断言（`assert ...`）来绕过失败。
+- ❌ 禁止删除别人的代码"为了让 import 通过"，必须先弄清原因。
+- ❌ 禁止 `git commit --no-verify`、`git push --force`、`git reset --hard`。
+- ❌ 禁止跳过验证就声明"完成"；如无法验证，必须在 HANDOFF.md 写明"未验证 + 原因"。
+
+------------------------------------------------------------
+## 4. 改完代码后的强制流程
+1. **更新 `docs/HANDOFF.md`**：
+   - 在"Change Log"区追加本次改动条目（日期 / agent 标签 / 文件 / 一句话总结 / 验证结果）。
+   - 在"Current State"区更新里程碑表格（哪些 M 已通过 / 哪些 in-progress / 哪些 blocked）。
+   - 在"Next Steps"区写下你认为下一位接手者应该做的 1–3 件事。
+   - 在"Open Issues / Known Bugs"区登记任何遗留问题。
+2. **更新 `docs/SO101_OMNIGIBSON_REKEP_PLAN.md`**：
+   - 如果发现方案与现实不符，立即修正对应章节，并在文末"变更日志"加一行。
+3. **不主动 commit**：除非用户明确要求。改完后告诉用户"已改 + 验证结果"，由用户决定是否提交。
+4. **清理临时文件**：自己创建的 scratch / tmp / log 文件必须删除或加进 `.gitignore`。
+
+------------------------------------------------------------
+## 5. 沟通契约
+- 回答用户用中文（项目语言）。
+- 报告结果**必须诚实**：失败说失败、未跑说未跑、不确定说不确定。
+- 不要扩大范围：用户没要求的"顺便优化"一律不做。
+- 遇到不可逆操作（删除文件 / 改 git 历史 / 改名 `assert→assets`）必须先问用户。
+
+------------------------------------------------------------
+## 6. 跨 agent 接力礼仪
+- 上一位留下的 `In Progress` 区如果非空，先读懂、再决定继续还是回滚。
+- 如果你不同意上一位的方案，**先在 HANDOFF.md 写讨论**，不要直接改代码。
+- 每条 Change Log 必须可追溯：写清楚改了哪些文件、行号区间、对哪个里程碑有影响。
+
+------------------------------------------------------------
+## 7. 出错时的回退
+- 改坏了：先 `git stash` 当前改动，跑上一里程碑的脚本验证基线 OK，再分析。
+- IK 跑不通：参考方案文档 R3，临时在 subgoal_solver.py 把 `ik_cost=0`，但**必须**在 HANDOFF.md 标注 "tech debt: ik disabled"。
+- 物理爆炸：参考方案文档 R1/R2/R8。
+- VLM 没 key：用 `--use_cached_query`，cached query 必须事先准备好。
+
+------------------------------------------------------------
+## 8. 简短 Checklist（每次开工 / 收工）
+
+开工前：
+- [ ] 读完 `.agent` + `docs/HANDOFF.md` + 方案文档相关章节
+- [ ] `git status` 干净
+- [ ] 在 HANDOFF.md "In Progress" 写下意图
+
+收工前：
+- [ ] 改动文件全部 `py_compile` 通过
+- [ ] 跑了对应里程碑的 smoke test 并记录结果
+- [ ] 更新了 HANDOFF.md（Change Log + Current State + Next Steps）
+- [ ] 必要时更新了 PLAN 文档
+- [ ] 没有遗留 tmp/log/未追踪大文件
+- [ ] 给用户的总结诚实、简洁、附验证结果
+
+------------------------------------------------------------
+违反以上任意一条 = 任务未完成。
