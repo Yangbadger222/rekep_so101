@@ -1,0 +1,9 @@
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """Place the grasped trash directly over the trash bin opening so it can drop in."""
+    trash_pos = keypoints[0]
+    bin_opening = np.mean(keypoints[1:5], axis=0)
+    # Hover 4cm above the bin rim before release; SO-101 has a 0.32m reach,
+    # the +7cm version used to push the EEF outside the reachable workspace.
+    target_pos = bin_opening + np.array([0.0, 0.0, 0.04])
+    cost = np.linalg.norm(trash_pos - target_pos)
+    return cost

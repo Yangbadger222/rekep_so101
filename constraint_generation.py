@@ -16,10 +16,18 @@ def encode_image(image_path):
 class ConstraintGenerator:
     def __init__(self, config):
         self.config = config
-        self.client = OpenAI(api_key=os.environ['OPENAI_API_KEY'], base_url="https://api.acceleai.cn/v1")
+        self.client = None
         self.base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), './vlm_query')
         with open(os.path.join(self.base_dir, 'prompt_template.txt'), 'r') as f:
             self.prompt_template = f.read()
+
+    def _get_client(self):
+        if self.client is None:
+            api_key = os.environ.get('OPENAI_API_KEY')
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY is required for live VLM queries; use --use_cached_query to run cached programs.")
+            self.client = OpenAI(api_key=api_key, base_url="https://api.acceleai.cn/v1")
+        return self.client
 
     def _build_prompt(self, image_path, instruction):
         img_base64 = encode_image(image_path)
@@ -135,7 +143,8 @@ class ConstraintGenerator:
         # build prompt
         messages = self._build_prompt(image_path, instruction)
         # stream back the response
-        stream = self.client.chat.completions.create(model=self.config['model'],
+        client = self._get_client()
+        stream = client.chat.completions.create(model=self.config['model'],
                                                         messages=messages,
                                                         temperature=self.config['temperature'],
                                                         max_tokens=self.config['max_tokens'],

@@ -1,8 +1,49 @@
 """
 Adapted from OmniGibson and the Lula IK solver
 """
+import os
+from contextlib import contextmanager
+
 import omnigibson.lazy as lazy
 import numpy as np
+
+
+@contextmanager
+def _temporary_cwd(path):
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def _resolve_path(path, base_dir=None):
+    """
+    Resolve @path to an absolute path, preferring @base_dir for relative paths
+    when that candidate exists.
+    """
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+
+    candidates = []
+    if base_dir is not None:
+        candidates.append(os.path.join(base_dir, path))
+    candidates.append(os.path.abspath(path))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return os.path.abspath(candidates[0])
+
+
+def _path_from_cwd(path, cwd):
+    """Return a stable path to use while the current working directory is @cwd."""
+    rel_path = os.path.relpath(path, cwd)
+    if rel_path == os.curdir or not rel_path.startswith(os.pardir + os.sep):
+        return rel_path
+    return path
+
 
 class IKSolver:
     """
@@ -18,7 +59,13 @@ class IKSolver:
         world2robot_homo,
     ):
         # Create robot description, kinematics, and config
-        self.robot_description = lazy.lula.load_robot(robot_description_path, robot_urdf_path)
+        self.robot_urdf_path = _resolve_path(robot_urdf_path)
+        self.robot_asset_root = os.path.dirname(self.robot_urdf_path)
+        self.robot_description_path = _resolve_path(robot_description_path, self.robot_asset_root)
+        robot_description_path = _path_from_cwd(self.robot_description_path, self.robot_asset_root)
+        robot_urdf_path = _path_from_cwd(self.robot_urdf_path, self.robot_asset_root)
+        with _temporary_cwd(self.robot_asset_root):
+            self.robot_description = lazy.lula.load_robot(robot_description_path, robot_urdf_path)
         self.kinematics = self.robot_description.kinematics()
         self.config = lazy.lula.CyclicCoordDescentIkConfig()
         self.eef_name = eef_name

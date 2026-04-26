@@ -1,0 +1,6 @@
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """Lift the grasped trash safely above the tabletop before moving toward the bin."""
+    trash_pos = keypoints[0]
+    target_height = 0.84
+    cost = np.maximum(0.0, target_height - trash_pos[2])
+    return cost

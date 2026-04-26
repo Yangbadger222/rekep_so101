@@ -9,9 +9,10 @@ import cv2
 import omnigibson as og
 from omnigibson.macros import gm
 from omnigibson.utils.usd_utils import PoseAPI, mesh_prim_mesh_to_trimesh_mesh, mesh_prim_shape_to_trimesh_mesh
-from omnigibson.robots.fetch import Fetch
 from omnigibson.controllers import IsGraspingState
 from og_utils import OGCamera
+from ik_solver import IKSolver
+from so101_robot import SO101
 from utils import (
     bcolors,
     get_clock_time,
@@ -20,7 +21,6 @@ from utils import (
     get_linear_interpolation_steps,
     linear_interpolate_poses,
 )
-from omnigibson.robots.manipulation_robot import ManipulationRobot
 from omnigibson.controllers.controller_base import ControlType, BaseController
 import torch
 
@@ -52,15 +52,26 @@ def custom_clip_control(self, control):
         control[idx] = clipped_control[idx]
     return control
 
-Fetch._initialize = ManipulationRobot._initialize
 BaseController.clip_control = custom_clip_control
+
+
+def _to_numpy(value, dtype=float):
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=dtype)
+
+
+def _lula_result_value(result, name):
+    value = getattr(result, name)
+    return value() if callable(value) else value
 
 class ReKepOGEnv:
     def __init__(self, config, scene_file, verbose=False):
         self.video_cache = []
         self.config = config
         self.verbose = verbose
-        self.config['scene']['scene_file'] = scene_file
+        if scene_file:
+            self.config['scene']['scene_file'] = scene_file
         self.bounds_min = np.array(self.config['bounds_min'])
         self.bounds_max = np.array(self.config['bounds_max'])
         self.interpolate_pos_step_size = self.config['interpolate_pos_step_size']
@@ -72,13 +83,24 @@ class ReKepOGEnv:
         for _ in range(10): og.sim.step()
         # robot vars
         self.robot = self.og_env.robots[0]
-        dof_idx = np.concatenate([self.robot.trunk_control_idx,
-                                  self.robot.arm_control_idx[self.robot.default_arm]])
-        self.reset_joint_pos = self.robot.reset_joint_pos[dof_idx]
+        if not isinstance(self.robot, SO101):
+            raise TypeError(f"ReKepOGEnv now expects SO101, got {type(self.robot).__name__}")
+        self.arm = self.robot.default_arm
+        self.arm_control_idx = _to_numpy(self.robot.arm_control_idx[self.arm], dtype=int)
+        self.arm_action_idx = _to_numpy(self.robot.arm_action_idx[self.arm], dtype=int)
+        self.gripper_action_idx = _to_numpy(self.robot.gripper_action_idx[self.arm], dtype=int)
+        self.reset_joint_pos = _to_numpy(self.robot.reset_joint_pos[self.arm_control_idx])
         self.world2robot_homo = T.pose_inv(T.pose2mat(self.robot.get_position_orientation()))
+        self.ik_solver = IKSolver(
+            robot_description_path=self.robot.robot_arm_descriptor_yamls[self.arm],
+            robot_urdf_path=self.robot.urdf_path,
+            eef_name=self.robot.eef_link_names[self.arm],
+            reset_joint_pos=self.reset_joint_pos,
+            world2robot_homo=self.world2robot_homo,
+        )
         # initialize cameras
         self._initialize_cameras(self.config['camera'])
-        self.last_og_gripper_action = 1.0
+        self.last_og_gripper_action = None
 
     # ======================================
     # = exposed functions
@@ -92,7 +114,7 @@ class ReKepOGEnv:
         start = time.time()
         exclude_names = ['wall', 'floor', 'ceiling']
         if exclude_robot:
-            exclude_names += ['fetch', 'robot']
+            exclude_names += ['fetch', 'robot', 'so101']
         if exclude_obj_in_hand:
             assert self.config['robot']['robot_config']['grasping_mode'] in ['assisted', 'sticky'], "Currently only supported for assisted or sticky grasping"
             in_hand_obj = self.robot._ag_obj_in_hand[self.robot.default_arm]
@@ -157,7 +179,7 @@ class ReKepOGEnv:
         self.keypoints = keypoints
         self._keypoint_registry = dict()
         self._keypoint2object = dict()
-        exclude_names = ['wall', 'floor', 'ceiling', 'table', 'fetch', 'robot']
+        exclude_names = ['wall', 'floor', 'ceiling', 'table', 'fetch', 'robot', 'so101']
         for idx, keypoint in enumerate(keypoints):
             closest_distance = np.inf
             for obj in self.og_env.scene.objects:
@@ -225,22 +247,20 @@ class ReKepOGEnv:
         """
         # add gripper collision points
         collision_points = []
-        for obj in self.og_env.scene.objects:
-            if 'fetch' in obj.name.lower():
-                for name, link in obj.links.items():
-                    if 'gripper' in name.lower() or 'wrist' in name.lower():  # wrist_roll and wrist_flex
-                        for collision_mesh in link.collision_meshes.values():
-                            mesh_prim_path = collision_mesh.prim_path
-                            mesh_type = collision_mesh.prim.GetPrimTypeInfo().GetTypeName()
-                            if mesh_type == 'Mesh':
-                                trimesh_object = mesh_prim_mesh_to_trimesh_mesh(collision_mesh.prim)
-                            else:
-                                trimesh_object = mesh_prim_shape_to_trimesh_mesh(collision_mesh.prim)
-                            world_pose_w_scale = PoseAPI.get_world_pose_with_scale(mesh_prim_path)
-                            trimesh_object.apply_transform(world_pose_w_scale)
-                            points_transformed = trimesh_object.sample(1000)
-                            # add to collision points
-                            collision_points.append(points_transformed)
+        for name, link in self.robot.links.items():
+            if 'gripper' in name.lower() or 'wrist' in name.lower():
+                for collision_mesh in link.collision_meshes.values():
+                    mesh_prim_path = collision_mesh.prim_path
+                    mesh_type = collision_mesh.prim.GetPrimTypeInfo().GetTypeName()
+                    if mesh_type == 'Mesh':
+                        trimesh_object = mesh_prim_mesh_to_trimesh_mesh(collision_mesh.prim)
+                    else:
+                        trimesh_object = mesh_prim_shape_to_trimesh_mesh(collision_mesh.prim)
+                    world_pose_w_scale = PoseAPI.get_world_pose_with_scale(mesh_prim_path)
+                    trimesh_object.apply_transform(world_pose_w_scale)
+                    points_transformed = trimesh_object.sample(1000)
+                    # add to collision points
+                    collision_points.append(points_transformed)
         # add object in hand collision points
         in_hand_obj = self.robot._ag_obj_in_hand[self.robot.default_arm]
         if in_hand_obj is not None:
@@ -256,8 +276,7 @@ class ReKepOGEnv:
                     points_transformed = trimesh_object.sample(1000)
                     # add to collision points
                     collision_points.append(points_transformed)
-        collision_points = np.concatenate(collision_points, axis=0)
-        return collision_points
+        return np.concatenate(collision_points, axis=0) if collision_points else np.empty((0, 3))
 
     def reset(self):
         self.og_env.reset()
@@ -266,7 +285,7 @@ class ReKepOGEnv:
         self.open_gripper()
         # moving arm to the side to unblock view 
         ee_pose = self.get_ee_pose()
-        ee_pose[:3] += np.array([0.0, -0.2, -0.1])
+        ee_pose[:3] += np.array([0.0, -0.05, -0.03])
         action = np.concatenate([ee_pose, [self.get_gripper_null_action()]])
         self.execute_action(action, precise=True)
         self.video_cache = []
@@ -287,33 +306,41 @@ class ReKepOGEnv:
         return self.get_ee_pose()[3:]
     
     def get_arm_joint_postions(self):
-        assert isinstance(self.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
-        arm = self.robot.default_arm
-        dof_idx = np.concatenate([self.robot.trunk_control_idx, self.robot.arm_control_idx[arm]])
-        arm_joint_pos = self.robot.get_joint_positions()[dof_idx]
-        return arm_joint_pos
+        return _to_numpy(self.robot.get_joint_positions()[self.arm_control_idx])
+
+    def _blank_robot_action(self):
+        action = np.zeros(self.robot.action_dim)
+        action[self.arm_action_idx] = self.get_arm_joint_postions()
+        if self.last_og_gripper_action is not None:
+            action[self.gripper_action_idx] = self.last_og_gripper_action
+        return action
+
+    def _gripper_command_action(self, gripper_command):
+        action = self._blank_robot_action()
+        action[self.gripper_action_idx] = gripper_command
+        return action
 
     def close_gripper(self):
         """
         Exposed interface: 1.0 for closed, -1.0 for open, 0.0 for no change
-        Internal OG interface: 1.0 for open, 0.0 for closed
+        SO-101 OG interface: 1.0 for closed, -1.0 for open, 0.0 for no change.
         """
-        if self.last_og_gripper_action == 0.0:
+        close_action = self.get_gripper_close_action()
+        if self.last_og_gripper_action == close_action:
             return
-        action = np.zeros(12)
-        action[10:] = [0, 0]  # gripper: float. 0. for closed, 1. for open.
+        action = self._gripper_command_action(close_action)
         for _ in range(30):
             self._step(action)
-        self.last_og_gripper_action = 0.0
+        self.last_og_gripper_action = close_action
 
     def open_gripper(self):
-        if self.last_og_gripper_action == 1.0:
+        open_action = self.get_gripper_open_action()
+        if self.last_og_gripper_action == open_action:
             return
-        action = np.zeros(12)
-        action[10:] = [1, 1]  # gripper: float. 0. for closed, 1. for open.
+        action = self._gripper_command_action(open_action)
         for _ in range(30):
             self._step(action)
-        self.last_og_gripper_action = 1.0
+        self.last_og_gripper_action = open_action
 
     def get_last_og_gripper_action(self):
         return self.last_og_gripper_action
@@ -387,14 +414,18 @@ class ReKepOGEnv:
             # ======================================
             # = move to target pose
             # ======================================
-            # move faster for intermediate poses
-            intermediate_pos_threshold = 0.10
-            intermediate_rot_threshold = 5.0
+            # SO-101 is a 5-DOF arm with Lula CCD IK; tight intermediate thresholds
+            # used to leave the wrist far behind every waypoint, producing the
+            # large rot_error spikes seen in earlier trash runs. Loosen the
+            # in-flight thresholds so the robot can stream through; only the
+            # final waypoint (precise=True) needs to be tight.
+            intermediate_pos_threshold = 0.05
+            intermediate_rot_threshold = 15.0
             for pose in pose_seq[:-1]:
-                self._move_to_waypoint(pose, intermediate_pos_threshold, intermediate_rot_threshold)
+                self._move_to_waypoint(pose, intermediate_pos_threshold, intermediate_rot_threshold, max_steps=8)
             # move to the final pose with required precision
             pose = pose_seq[-1]
-            self._move_to_waypoint(pose, pos_threshold, rot_threshold, max_steps=20 if not precise else 40) 
+            self._move_to_waypoint(pose, pos_threshold, rot_threshold, max_steps=20 if not precise else 40)
             # compute error
             pos_error, rot_error = self.compute_target_delta_ee(target_pose)
             self.verbose and print(f'\n{bcolors.BOLD}[environment.py | {get_clock_time()}] Move to pose completed (pos_error: {pos_error}, rot_error: {np.rad2deg(rot_error)}){bcolors.ENDC}\n')
@@ -463,29 +494,48 @@ class ReKepOGEnv:
         pos_errors = []
         rot_errors = []
         count = 0
+        ik_fail_streak = 0
+        max_ik_fails = 3  # tolerate a few IK failures before bailing -- transient seeds occasionally miss
+        last_target_joint_pos = None
         while count < max_steps:
             reached, pos_error, rot_error = self._check_reached_ee(target_pose_world[:3], target_pose_world[3:7], pos_threshold, rot_threshold)
             pos_errors.append(pos_error)
             rot_errors.append(rot_error)
             if reached:
                 break
-            # convert world pose to robot pose
-            target_pose_robot = np.dot(self.world2robot_homo, T.convert_pose_quat2mat(target_pose_world))
-            # convert to relative pose to be used with the underlying controller
-            self.relative_eef_position = self.robot.get_relative_eef_position()
-            if torch.is_tensor(self.relative_eef_position):
-                self.relative_eef_position = self.relative_eef_position.detach().cpu().numpy()
-            relative_position = target_pose_robot[:3, 3] - self.relative_eef_position
-            relative_quat = T.quat_distance(T.mat2quat(target_pose_robot[:3, :3]), self.robot.get_relative_eef_orientation())
-            assert isinstance(self.robot, Fetch), "this action space is only for fetch"
-            action = np.zeros(12)  # first 3 are base, which we don't use
-            action[4:7] = relative_position
-            action[7:10] = T.quat2axisangle(relative_quat)
-            action[10:] = [self.last_og_gripper_action, self.last_og_gripper_action]
+            ik_result = self.ik_solver.solve(
+                T.convert_pose_quat2mat(target_pose_world),
+                position_tolerance=pos_threshold,
+                orientation_tolerance=np.deg2rad(rot_threshold),
+                initial_joint_pos=self.get_arm_joint_postions(),
+            )
+            ik_success = bool(_lula_result_value(ik_result, "success"))
+            target_joint_pos = np.asarray(_lula_result_value(ik_result, "cspace_position"), dtype=float)
+            if not ik_success or not np.all(np.isfinite(target_joint_pos)):
+                ik_fail_streak += 1
+                if ik_fail_streak >= max_ik_fails:
+                    print(
+                        f'{bcolors.WARNING}[environment.py | {get_clock_time()}] SO101 IK failed {ik_fail_streak}x for waypoint; '
+                        f'giving up at pos_error={pos_error.round(4)}, rot_error={np.rad2deg(rot_error).round(4)}{bcolors.ENDC}'
+                    )
+                    break
+                # Hold the previous joint target (or current pose) and step once;
+                # this lets the simulator settle and the next IK seed start from
+                # a slightly different configuration instead of bailing instantly.
+                hold_action = self._blank_robot_action()
+                if last_target_joint_pos is not None:
+                    hold_action[self.arm_action_idx] = last_target_joint_pos
+                self._step(action=hold_action)
+                count += 1
+                continue
+            ik_fail_streak = 0
+            last_target_joint_pos = target_joint_pos
+            action = self._blank_robot_action()
+            action[self.arm_action_idx] = target_joint_pos
             # step the action
             _ = self._step(action=action)
             count += 1
-        if count == max_steps:
+        if count == max_steps and not reached:
             print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}] OSC pose not reached after {max_steps} steps (pos_error: {pos_errors[-1].round(4)}, rot_error: {np.rad2deg(rot_errors[-1]).round(4)}){bcolors.ENDC}')
 
     def _step(self, action=None):

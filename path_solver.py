@@ -17,6 +17,13 @@ from utils import (
 )
 import torch
 
+COLLISION_COST_WEIGHT = 0.8
+COLLISION_SAFETY_MARGIN = 0.10
+PATH_LENGTH_WEIGHT = 4.0
+REACHABILITY_WEIGHT = 20.0
+IK_POSITION_ERROR_WEIGHT = 300.0
+JOINT_REG_WEIGHT = 0.2
+
 # ====================================
 # = objective function
 # ====================================
@@ -53,19 +60,25 @@ def objective(opt_vars,
     cost = 0
     # collision cost
     if collision_points_centered is not None:
-        collision_cost = 0.5 * calculate_collision_cost(poses_homo[start_idx:end_idx], sdf_func, collision_points_centered, 0.20)
+        collision_cost = COLLISION_COST_WEIGHT * calculate_collision_cost(
+            poses_homo[start_idx:end_idx],
+            sdf_func,
+            collision_points_centered,
+            COLLISION_SAFETY_MARGIN,
+        )
         debug_dict['collision_cost'] = collision_cost
         cost += collision_cost
 
     # penalize path length
     pos_length, rot_length = path_length(poses_homo)
     approx_length = pos_length + rot_length * 1.0
-    path_length_cost = 4.0 * approx_length
+    path_length_cost = PATH_LENGTH_WEIGHT * approx_length
     debug_dict['path_length_cost'] = path_length_cost
     cost += path_length_cost
 
     # reachability cost
     ik_cost = 0
+    ik_pos_error_cost = 0
     reset_reg_cost = 0
     debug_dict['ik_pos_error'] = []
     debug_dict['ik_feasible'] = []
@@ -78,19 +91,23 @@ def objective(opt_vars,
                     )
         debug_dict['ik_pos_error'].append(ik_result.position_error)
         debug_dict['ik_feasible'].append(ik_result.success)
-        ik_cost += 20.0 * (ik_result.num_descents / max_iterations)
+        ik_cost += REACHABILITY_WEIGHT * (ik_result.num_descents / max_iterations)
+        ik_pos_error_cost += IK_POSITION_ERROR_WEIGHT * ik_result.position_error
         if ik_result.success:
             reset_joint_pos = reset_joint_pos.detach().cpu().numpy() if torch.is_tensor(reset_joint_pos) else reset_joint_pos
-            reset_reg = np.linalg.norm(ik_result.cspace_position[:-1] - reset_joint_pos[:-1])
+            n_joints = min(len(ik_result.cspace_position), len(reset_joint_pos))
+            reset_reg = np.linalg.norm(ik_result.cspace_position[:n_joints] - reset_joint_pos[:n_joints])
             reset_reg = np.clip(reset_reg, 0.0, 3.0)
         else:
             reset_reg = 3.0
-        reset_reg_cost += 0.2 * reset_reg
+        reset_reg_cost += JOINT_REG_WEIGHT * reset_reg
     debug_dict['ik_pos_error'] = np.array(debug_dict['ik_pos_error'])
     debug_dict['ik_feasible'] = np.array(debug_dict['ik_feasible'])
     debug_dict['ik_cost'] = ik_cost
+    debug_dict['ik_pos_error_cost'] = ik_pos_error_cost
     debug_dict['reset_reg_cost'] = reset_reg_cost
     cost += ik_cost
+    cost += ik_pos_error_cost
 
     # # path constraint violation cost
     debug_dict['path_violation'] = None

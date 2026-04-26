@@ -1,0 +1,5 @@
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the trash piece (keypoint 0) for grasping."""
+    trash_pos = keypoints[0]
+    cost = np.linalg.norm(end_effector - trash_pos)
+    return cost

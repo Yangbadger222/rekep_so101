@@ -51,6 +51,8 @@ videos/
 vlm_query/*
 !vlm_query/prompt_template.txt
 !vlm_query/pen/
+!vlm_query/trash_cleanup/
+!vlm_query/trash_cleanup/**
 
 # Local tooling metadata
 .codex

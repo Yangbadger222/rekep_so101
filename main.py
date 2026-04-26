@@ -1,8 +1,47 @@
+import os
+import sys
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap: configure environment before importing omnigibson / heavy deps so
+# `python main.py --task trash` works out-of-the-box (mirrors the original
+# ReKep entry point UX). Three things happen here, all best-effort:
+#   1. Re-exec under the omnigibson conda env Python if we are not already
+#      running inside it -- Isaac Sim only loads from that interpreter.
+#   2. Default OMNIGIBSON_HEADLESS=1 unless the user explicitly opts in to
+#      a window via `--gui` (or sets the env var beforehand).
+#   3. Pull OPENAI_API_KEY from ~/.zshrc (codex-style JSON line) when it is
+#      missing, so live VLM queries do not silently fail with a swallowed
+#      RuntimeError after Isaac Kit has already started shutting down.
+# ---------------------------------------------------------------------------
+_REKEP_BOOTSTRAPPED = os.environ.get('REKEP_BOOTSTRAPPED') == '1'
+if not _REKEP_BOOTSTRAPPED:
+    _OG_PYTHON = '/home/badger/anaconda3/envs/omnigibson/bin/python'
+    if os.path.exists(_OG_PYTHON) and os.path.realpath(sys.executable) != os.path.realpath(_OG_PYTHON):
+        os.environ['REKEP_BOOTSTRAPPED'] = '1'
+        os.execv(_OG_PYTHON, [_OG_PYTHON, os.path.abspath(__file__), *sys.argv[1:]])
+    os.environ['REKEP_BOOTSTRAPPED'] = '1'
+
+if '--gui' not in sys.argv and 'OMNIGIBSON_HEADLESS' not in os.environ:
+    os.environ['OMNIGIBSON_HEADLESS'] = '1'
+
+if not os.environ.get('OPENAI_API_KEY'):
+    _zshrc = os.path.expanduser('~/.zshrc')
+    if os.path.exists(_zshrc):
+        try:
+            import re
+            with open(_zshrc, 'r') as _f:
+                _m = re.search(r'"OPENAI_API_KEY"\s*:\s*"([^"]+)"', _f.read())
+            if _m:
+                os.environ['OPENAI_API_KEY'] = _m.group(1)
+        except Exception:
+            pass
+
 import torch
 import numpy as np
 import json
-import os
 import argparse
+import omnigibson as og
 from environment import ReKepOGEnv
 from keypoint_proposal import KeypointProposer
 from constraint_generation import ConstraintGenerator
@@ -11,7 +50,7 @@ from subgoal_solver import SubgoalSolver
 from path_solver import PathSolver
 from visualizer import Visualizer
 import transform_utils as T
-from omnigibson.robots.fetch import Fetch
+from so101_robot import SO101
 from utils import (
     bcolors,
     get_config,
@@ -39,7 +78,9 @@ class Main:
         # initialize environment
         self.env = ReKepOGEnv(global_config['env'], scene_file, verbose=False)
         # setup ik solver (for reachability cost)
-        assert isinstance(self.env.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
+        assert isinstance(self.env.robot, SO101), (
+            f"The IK solver assumes the robot is an SO101 robot, got {type(self.env.robot).__name__}"
+        )
         ik_solver = IKSolver(
             robot_description_path=self.env.robot.robot_arm_descriptor_yamls[self.env.robot.default_arm],
             robot_urdf_path=self.env.robot.urdf_path,
@@ -151,16 +192,27 @@ class Main:
                 # ====================================
                 if self.last_sim_step_counter == self.env.step_counter:
                     print(f"{bcolors.WARNING}sim did not step forward within last iteration (HINT: adjust action_steps_per_iter to be larger or the pos_threshold to be smaller){bcolors.ENDC}")
-                next_subgoal = self._get_next_subgoal(from_scratch=self.first_iter)
-                next_path = self._get_next_path(next_subgoal, from_scratch=self.first_iter)
-                self.first_iter = False
-                self.action_queue = next_path.tolist()
-                self.last_sim_step_counter = self.env.step_counter
+
+                # Grasp / release stages are executed directly with the
+                # closed-loop top-down primitive: SubgoalSolver's 6D pose
+                # search is unstable for SO-101's 5-DOF arm, and the dense
+                # spline path it produces routinely contains waypoints the
+                # IK cannot track. The primitive always uses an
+                # IK-reachable orientation (verified empirically).
+                if self.is_grasp_stage or self.is_release_stage:
+                    self.action_queue = []
+                    self.first_iter = False
+                    self.last_sim_step_counter = self.env.step_counter
+                else:
+                    next_subgoal = self._get_next_subgoal(from_scratch=self.first_iter)
+                    next_path = self._get_next_path(next_subgoal, from_scratch=self.first_iter)
+                    self.first_iter = False
+                    self.action_queue = next_path.tolist()
+                    self.last_sim_step_counter = self.env.step_counter
 
                 # ====================================
                 # = execute
                 # ====================================
-                # determine if we proceed to the next stage
                 count = 0
                 while len(self.action_queue) > 0 and count < self.config['action_steps_per_iter']:
                     next_action = self.action_queue.pop(0)
@@ -173,7 +225,7 @@ class Main:
                     elif self.is_release_stage:
                         self._execute_release_action()
                     # if completed, save video and return
-                    if self.stage == self.program_info['num_stages']: 
+                    if self.stage == self.program_info['num_stages']:
                         self.env.sleep(2.0)
                         save_path = self.env.save_video()
                         print(f"{bcolors.OKGREEN}Video saved to {save_path}\n\n{bcolors.ENDC}")
@@ -258,13 +310,119 @@ class Main:
             self.keypoint_movable_mask[i] = self.env.is_grasping(keypoint_object)
 
     def _execute_grasp_action(self):
-        pregrasp_pose = self.env.get_ee_pose()
-        grasp_pose = pregrasp_pose.copy()
-        grasp_pose[:3] += T.quat2mat(pregrasp_pose[3:]) @ np.array([self.config['grasp_depth'], 0, 0])
-        grasp_action = np.concatenate([grasp_pose, [self.env.get_gripper_close_action()]])
-        self.env.execute_action(grasp_action, precise=True)
-    
+        # Closed-loop top-down grasp targeted at the actual trash keypoint.
+        # Strategy: drive joint positions directly via IK (bypassing the
+        # SubgoalSolver/path_solver/execute_action interpolation chain) so we
+        # skip the spline waypoint that the SO-101 5-DOF wrist cannot track.
+        # This is the same control surface a real SO-101 uses (Lula IK +
+        # JointController), so it is sim2real-friendly.
+        grasp_keypoint_idx = self.program_info['grasp_keypoints'][self.stage - 1]
+        if grasp_keypoint_idx == -1:
+            return
+        target_obj = self.env.get_object_by_keypoint(grasp_keypoint_idx)
+        target_pos = self.env.get_keypoint_positions()[grasp_keypoint_idx]
+
+        # Top-down orientation reachable by SO-101 over the workspace
+        # (verified empirically: EEF +Z -> world -Z is reachable, +X -> -Z is not).
+        topdown_rotmat = np.array([
+            [1.0,  0.0,  0.0],
+            [0.0, -1.0,  0.0],
+            [0.0,  0.0, -1.0],
+        ])
+        topdown_quat = T.mat2quat(topdown_rotmat)
+
+        pregrasp_xyz = target_pos + np.array([0.0, 0.0, 0.07])
+        descend_xyz = target_pos + np.array([0.0, 0.0, max(0.005, self.config['grasp_depth'] * 0.5)])
+        lift_xyz = target_pos + np.array([0.0, 0.0, 0.06])
+
+        # Phase 1: pre-grasp hover. Drive joints directly via IK at a fixed
+        # top-down orientation; no spline interpolation between current and
+        # target poses (which is what was killing the wrist before).
+        self._drive_to_pose(pregrasp_xyz, topdown_quat, gripper_action=self.env.get_gripper_open_action(), max_iters=80)
+
+        # Phase 2: descend straight down to grasp depth.
+        self._drive_to_pose(descend_xyz, topdown_quat, gripper_action=self.env.get_gripper_open_action(), max_iters=40)
+
+        # Phase 3: close gripper, wait for assisted grasp confirmation.
+        self.env.close_gripper()
+        for _ in range(20):
+            if self.env.is_grasping(target_obj):
+                break
+            self.env._step(self.env._gripper_command_action(self.env.get_gripper_close_action()))
+
+        # Phase 4: lift to clear the table before stage 2 starts.
+        self._drive_to_pose(lift_xyz, topdown_quat, gripper_action=self.env.get_gripper_close_action(), max_iters=40)
+
+    def _drive_to_pose(self, target_xyz, target_quat, gripper_action, max_iters=60, pos_tol=0.01, rot_tol_deg=10.0):
+        """Drive the SO-101 toward a Cartesian pose via direct IK + JointController.
+
+        Unlike env.execute_action(), this does NOT spline-interpolate between
+        the current pose and the target pose; it asks the IK solver for a
+        single joint configuration, then steps the simulator with that
+        joint target until the EEF reaches it (or max_iters elapses). This
+        avoids dense intermediate waypoints that the SO-101 wrist cannot
+        reach during large rotation changes.
+        """
+        env = self.env
+        target_quat = np.asarray(target_quat, dtype=float)
+        target_xyz = np.asarray(target_xyz, dtype=float)
+        target_pose_homo = T.pose2mat([target_xyz, target_quat])
+        ik_result = env.ik_solver.solve(
+            target_pose_homo,
+            position_tolerance=pos_tol,
+            orientation_tolerance=np.deg2rad(rot_tol_deg),
+            initial_joint_pos=env.get_arm_joint_postions(),
+            max_iterations=200,
+        )
+        from environment import _lula_result_value
+        ik_success = bool(_lula_result_value(ik_result, "success"))
+        target_joint_pos = np.asarray(_lula_result_value(ik_result, "cspace_position"), dtype=float)
+        if not ik_success or not np.all(np.isfinite(target_joint_pos)):
+            print(f"{bcolors.WARNING}[main.py] _drive_to_pose: IK could not solve for "
+                  f"xyz={target_xyz}, falling back to closest-feasible joints{bcolors.ENDC}")
+            if not np.all(np.isfinite(target_joint_pos)):
+                return
+        action = env._blank_robot_action()
+        action[env.arm_action_idx] = target_joint_pos
+        action[env.gripper_action_idx] = gripper_action
+        for _ in range(max_iters):
+            env._step(action=action)
+            curr_pos = env.get_ee_pos()
+            if np.linalg.norm(curr_pos - target_xyz) < pos_tol * 2:
+                break
+
     def _execute_release_action(self):
+        # Closed-loop release: hover above the release target (drop zone) with a
+        # top-down EEF, then open. Bypasses SubgoalSolver for the same reason
+        # as _execute_grasp_action -- IK reach + sim2real friendliness.
+        release_kp_idx = self.program_info['release_keypoints'][self.stage - 1]
+        if release_kp_idx == -1:
+            self.env.open_gripper()
+            return
+        # Build the drop position. If the release keypoint is the grasped
+        # object itself (typical: trash released "above the bin"), fall back
+        # to the bin keypoints (any keypoint that is NOT a grasp_keypoint and
+        # is reasonably far from the trash).
+        release_pos = self.env.get_keypoint_positions()[release_kp_idx]
+        # If the release keypoint is the grasped object, look for a non-grasp
+        # keypoint near the bin to use as the drop target.
+        grasp_keypoints = self.program_info.get('grasp_keypoints', [])
+        if release_kp_idx in grasp_keypoints:
+            other_kps = self.env.get_keypoint_positions()
+            non_grasp_idxs = [i for i in range(len(other_kps)) if i not in grasp_keypoints]
+            if non_grasp_idxs:
+                release_pos = np.mean(other_kps[non_grasp_idxs], axis=0)
+
+        topdown_rotmat = np.array([
+            [1.0,  0.0,  0.0],
+            [0.0, -1.0,  0.0],
+            [0.0,  0.0, -1.0],
+        ])
+        topdown_quat = T.mat2quat(topdown_rotmat)
+        # Hover above the drop target (direct IK, no spline interpolation).
+        self._drive_to_pose(release_pos + np.array([0.0, 0.0, 0.06]), topdown_quat,
+                            gripper_action=self.env.get_gripper_close_action(), max_iters=80)
+        # Drop.
         self.env.open_gripper()
 
 if __name__ == "__main__":
@@ -273,6 +431,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_cached_query', action='store_true', help='instead of querying the VLM, use the cached query')
     parser.add_argument('--apply_disturbance', action='store_true', help='apply disturbance to test the robustness')
     parser.add_argument('--visualize', action='store_true', help='visualize each solution before executing (NOTE: this is blocking and needs to press "ESC" to continue)')
+    parser.add_argument('--gui', action='store_true', help='show the OmniGibson viewer window instead of running headless')
     args = parser.parse_args()
 
     if args.apply_disturbance:
@@ -372,11 +531,37 @@ if __name__ == "__main__":
             'rekep_program_dir': './vlm_query/pen',
             'disturbance_seq': {1: stage1_disturbance_seq, 2: stage2_disturbance_seq, 3: stage3_disturbance_seq},
             },
+        'trash': {
+            'scene_file': './configs/og_scene_file_trash.json',
+            'instruction': (
+                'Use the fixed SO-101 robot mounted on the table to pick up one piece of trash on the tabletop '
+                'and place it into the trash bin.'
+            ),
+            'rekep_program_dir': './vlm_query/trash_cleanup',
+            },
     }
-    task = task_list['pen']
+    if args.task not in task_list:
+        raise ValueError(f"Unknown task {args.task!r}. Available tasks: {sorted(task_list)}")
+    task = task_list[args.task]
     scene_file = task['scene_file']
     instruction = task['instruction']
-    main = Main(scene_file, visualize=args.visualize)
-    main.perform_task(instruction,
-                    rekep_program_dir=task['rekep_program_dir'] if args.use_cached_query else None,
-                    disturbance_seq=task.get('disturbance_seq', None) if args.apply_disturbance else None)
+    main = None
+    try:
+        main = Main(scene_file, visualize=args.visualize)
+        main.perform_task(instruction,
+                        rekep_program_dir=task['rekep_program_dir'] if args.use_cached_query else None,
+                        disturbance_seq=task.get('disturbance_seq', None) if args.apply_disturbance else None)
+    except BaseException as exc:
+        # Isaac/OG installs a global excepthook that swallows tracebacks once the Kit
+        # app starts shutting down. Print to stderr ourselves so the user sees the
+        # real failure (e.g. missing OPENAI_API_KEY) instead of a silent Shutting Down.
+        import sys, traceback
+        sys.stderr.write(f"\n{bcolors.FAIL}[main.py] perform_task failed: "
+                         f"{type(exc).__name__}: {exc}{bcolors.ENDC}\n")
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
+    finally:
+        if main is not None:
+            import omnigibson as og
+            og.shutdown()

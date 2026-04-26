@@ -1,0 +1,20 @@
+{
+  "init_keypoint_positions": [
+    [0.15, 0.0, 0.7625],
+    [-0.15, 0.215, 0.84],
+    [-0.15, 0.085, 0.84],
+    [-0.085, 0.15, 0.84],
+    [-0.215, 0.15, 0.84]
+  ],
+  "num_keypoints": 5,
+  "num_stages": 3,
+  "grasp_keypoints": [0, -1, -1],
+  "release_keypoints": [-1, -1, 0],
+  "keypoint_descriptions": [
+    "trash_0 center",
+    "trash bin north rim",
+    "trash bin south rim",
+    "trash bin east rim",
+    "trash bin west rim"
+  ]
+}

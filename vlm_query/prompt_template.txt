@@ -25,6 +25,16 @@ Suppose you are controlling a robot to perform manipulation tasks by writing con
     - "drop the red block on top of blue block" stage:
       - 1 sub-goal constraints: "the red block is 10cm on top of the blue block"
       - 1 path constraints: "the robot must still be grasping the red block"
+  - "pick up tabletop trash and place it into a trash bin":
+    - "grasp trash" stage:
+      - 1 sub-goal constraints: "align the end-effector with the trash piece"
+      - 0 path constraints
+    - "lift trash" stage:
+      - 1 sub-goal constraints: "the trash piece is lifted above the table"
+      - 2 path constraints: "the robot must still be grasping the trash piece", "the trash piece stays above the table"
+    - "drop trash into bin" stage:
+      - 1 sub-goal constraints: "the trash piece is above the trash bin opening"
+      - 1 path constraints: "the robot must still be grasping the trash piece"
   - "eorient bouquet and drop it upright into vase":
     - "grasp bouquet" stage:
       - 1 sub-goal constraints: "align the end-effector with the bouquet stem"
@@ -58,6 +68,14 @@ Suppose you are controlling a robot to perform manipulation tasks by writing con
 - The keypoints marked on the image start with index 0, same as the given argument `keypoints` array.
 - For a point `i` to be relative to another point `j`, the function should define an `offsetted_point` variable that has the delta added to keypoint `j and then calculate the norm of the xyz coordinates of the keypoint `i` and the `offsetted_point`.
 - If you would like to specify a location not marked by a keypoint, try using multiple keypoints to specify the location (e.g., you may take the mean of multiple keypoints if the desired location is in the center of those keypoints).
+
+**Critical correctness rules — read carefully, these are common failure modes:**
+- A constraint must return a cost that *changes* as the robot acts. NEVER write a constraint where the cost is a constant (e.g. `cost = 0.10`) or trivially zero (e.g. `cost = trash_kp[2] - trash_kp[2]`); such constraints either always fail or always succeed and break the optimizer.
+- For a sub-goal that says "object X must reach height Z", express it as: `cost = abs(keypoints[i][2] - target_z)` where `target_z` is a numeric scalar (e.g. `target_z = bin_keypoint[2] + 0.10`). Do NOT add the same offset on both sides of the equation.
+- For a sub-goal that says "object X must be above region Y", express it as: `target_xyz = bin_center + np.array([0,0,0.10])` and `cost = np.linalg.norm(keypoints[i] - target_xyz)`. The `target_xyz` MUST be derived from a *different* keypoint than `keypoints[i]`, otherwise the cost is constant.
+- For a path constraint "stay above the table", use a fixed numeric floor like `cost = (table_z + 0.02) - keypoints[i][2]` where `table_z` is the lowest tabletop keypoint's z, NOT `keypoints[i][2] - keypoints[i][2]`.
+- The grasped object's keypoint coordinates DO update each step (the framework rewrites them via the EEF pose). So in stage 2/3 constraints, `keypoints[i]` is the current world position of object i — treat it as a variable, not a constant.
+- For grasping stage, the only sub-goal constraint should be `cost = np.linalg.norm(end_effector - keypoints[i])` where i is the keypoint to grasp. Do not add height offsets here — alignment is what matters.
 
 **Structure your output in a single python code block as follows:**
 ```python

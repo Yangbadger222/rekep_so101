@@ -13,6 +13,19 @@ from utils import (
     consistency,
 )
 import torch
+
+GRASP_APPROACH_AXIS = 0  # SO-101 gripper_frame_link +X is the approach direction used by Main._execute_grasp_action.
+# Prefer a top-down approach (EEF +X pointing along world -Z) for SO-101 tabletop
+# manipulation. This matches the natural arm posture and keeps wrist within IK reach.
+# Weight is low so it acts as a soft hint, not a hard constraint -- the actual
+# grasp is closed-loop in main._execute_grasp_action.
+GRASP_PREFERRED_DIR = np.array([0.0, 0.0, -1.0])
+GRASP_COST_WEIGHT = 1.0
+IK_POSITION_ERROR_WEIGHT = 300.0
+SUBGOAL_CONSTRAINT_WEIGHT = 500.0
+PATH_CONSTRAINT_WEIGHT = 200.0
+
+
 def objective(opt_vars,
             og_bounds,
             keypoints_centered,
@@ -53,10 +66,13 @@ def objective(opt_vars,
                     initial_joint_pos=initial_joint_pos,
                 )
     ik_cost = 20.0 * (ik_result.num_descents / max_iterations)
+    ik_pos_error_cost = IK_POSITION_ERROR_WEIGHT * ik_result.position_error
     debug_dict['ik_feasible'] = ik_result.success
     debug_dict['ik_pos_error'] = ik_result.position_error
     debug_dict['ik_cost'] = ik_cost
+    debug_dict['ik_pos_error_cost'] = ik_pos_error_cost
     cost += ik_cost
+    cost += ik_pos_error_cost
     if ik_result.success:
         reset_joint_pos = reset_joint_pos.detach().cpu().numpy() if torch.is_tensor(reset_joint_pos) else reset_joint_pos
         reset_reg = np.linalg.norm(ik_result.cspace_position[:-1] - reset_joint_pos[:-1])
@@ -69,9 +85,10 @@ def objective(opt_vars,
 
     # grasp metric (better performance if using anygrasp or force-based grasp metrics)
     if is_grasp_stage:
-        preferred_dir = np.array([0, 0, -1]) 
-        grasp_cost = -np.dot(opt_pose_homo[:3, 0], preferred_dir) + 1  # [0, 1]
-        grasp_cost = 10.0 * grasp_cost
+        grasp_axis = opt_pose_homo[:3, GRASP_APPROACH_AXIS]
+        grasp_cost = -np.dot(grasp_axis, GRASP_PREFERRED_DIR) + 1  # [0, 2]
+        grasp_cost = GRASP_COST_WEIGHT * grasp_cost
+        debug_dict['grasp_axis'] = 'eef_x'
         debug_dict['grasp_cost'] = grasp_cost
         cost += grasp_cost
 
@@ -86,7 +103,7 @@ def objective(opt_vars,
             violation = constraint(transformed_keypoints[0], transformed_keypoints[1:])
             subgoal_violation.append(violation)
             subgoal_constraint_cost += np.clip(violation, 0, np.inf)
-        subgoal_constraint_cost = 200.0*subgoal_constraint_cost
+        subgoal_constraint_cost = SUBGOAL_CONSTRAINT_WEIGHT * subgoal_constraint_cost
         debug_dict['subgoal_constraint_cost'] = subgoal_constraint_cost
         debug_dict['subgoal_violation'] = subgoal_violation
         cost += subgoal_constraint_cost
@@ -101,7 +118,7 @@ def objective(opt_vars,
             violation = constraint(transformed_keypoints[0], transformed_keypoints[1:])
             path_violation.append(violation)
             path_constraint_cost += np.clip(violation, 0, np.inf)
-        path_constraint_cost = 200.0*path_constraint_cost
+        path_constraint_cost = PATH_CONSTRAINT_WEIGHT * path_constraint_cost
         debug_dict['path_constraint_cost'] = path_constraint_cost
         debug_dict['path_violation'] = path_violation
         cost += path_constraint_cost

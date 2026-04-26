@@ -1,0 +1,10 @@
+def stage2_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the trash piece."""
+    return get_grasping_cost_by_keypoint_idx(0)
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The grasped trash should stay above the tabletop during lifting."""
+    trash_pos = keypoints[0]
+    table_clearance = 0.78
+    cost = np.maximum(0.0, table_clearance - trash_pos[2])
+    return cost

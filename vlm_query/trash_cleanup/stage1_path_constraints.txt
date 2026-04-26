@@ -1,0 +1,1 @@
+# No path constraints for the initial grasp stage.

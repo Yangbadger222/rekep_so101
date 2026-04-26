@@ -2,27 +2,27 @@ device: &device 'cuda'
 seed: &seed 0
 
 main:
-  interpolate_pos_step_size: &interpolate_pos_step_size 0.05  # controls the density of the final returned path
-  interpolate_rot_step_size: &interpolate_rot_step_size 0.34  # about 20 degrees
-  grasp_depth: 0.10
-  constraint_tolerance: 0.10  # for backtracking
-  bounds_min: &bounds_min [-0.45, -0.75, 0.698]
-  bounds_max: &bounds_max [0.10, 0.60, 1.2]
+  interpolate_pos_step_size: &interpolate_pos_step_size 0.03  # smaller -> denser dense path -> smoother SO-101 trajectory
+  interpolate_rot_step_size: &interpolate_rot_step_size 0.10  # ~5.7 deg per step (was 10 deg, too aggressive for IK to track)
+  grasp_depth: 0.02   # SO-101 finger length is 0.035m; push 2cm into the object to seat it before closing
+  constraint_tolerance: 0.05  # tighter (was 0.10): we want subgoal cost to actually drive task progress, not be auto-satisfied
+  bounds_min: &bounds_min [-0.25, -0.25, 0.75]   # SO-101 fixed at [0,-0.15,0.75]; reach radius ~0.32m, stay inside
+  bounds_max: &bounds_max [0.25, 0.25, 1.05]
   sdf_voxel_size: 0.01
   vlm_camera: 0
-  action_steps_per_iter: 5
+  action_steps_per_iter: 50  # was 5 -> path was never drained for SO-101 (small workspace = ~16 dense waypoints/replan)
   seed: *seed
 
 env:
   video_cache_size: 2000
   og_sim:
-    physics_frequency: 60
-    action_frequency: 15
+    physics_frequency: 120
+    action_frequency: 30
     
   scene:
-    name: Rs_int
-    type: InteractiveTraversableScene
-    scene_model: Rs_int
+    type: Scene
+    use_floor_plane: true
+    floor_plane_visible: false
 
   bounds_min: *bounds_min
   bounds_max: *bounds_max
@@ -31,48 +31,46 @@ env:
 
   robot:
     robot_config:
-      name: Fetch
-      type: Fetch
-      obs_modalities: [rgb, depth]
+      name: so101
+      type: SO101
+      obs_modalities: []
       action_modalities: continuous
       action_normalize: False
-      position: [-0.8, 0.0, 0.]
+      position: [0.0, -0.15, 0.75]
       grasping_mode: assisted
 
       controller_config:
-        base:
-          name: DifferentialDriveController
         arm_0:
-          name: OperationalSpaceController
-          kp: 250
-          kp_limits: [50, 400]
-          damping_ratio: 0.6
+          name: JointController
+          motor_type: position
+          command_input_limits:
+          command_output_limits:
+          use_delta_commands: false
+          use_impedances: false
         gripper_0:
           name: MultiFingerGripperController
-          command_input_limits: [0.0, 1.0]
-          mode: smooth
-        camera:
-          name: JointController
+          mode: binary
+          inverted: true
 
   camera:
-    # recorder 
+    # recorder
     1:
-      name: cam_1
-      position: [ 0.6137,  0.4764,  1.4565]
-      orientation: [ 0.3212,  0.4682,  0.6788,  0.4656]
-      resolution: 480
+      name: record_camera
+      position: [0.55, -0.65, 1.15]
+      orientation: [0.520686, 0.202538, 0.300668, 0.772957]
+      resolution: 640
 
     # vlm camera
     0:
-      name: cam_0
-      position: [-0.1655,  0.0167,  1.3664]
-      orientation: [ 0.0550,  0.0544,  0.7010,  0.7090]
-      resolution: 480
+      name: vlm_camera
+      position: [0.0, -0.05, 1.42]
+      orientation: [0.0, 0.0, 0.0, 1.0]
+      resolution: 720
 
 path_solver:
-  opt_pos_step_size: 0.20  # controls the density of control points in the path
-  opt_rot_step_size: 0.78  # controls the density of control points in the path
-  opt_interpolate_pos_step_size: 0.02  # controls the density of collision checking inside optimization
+  opt_pos_step_size: 0.04   # was 0.06; smaller -> more control points -> SO-101 can track rotation between them
+  opt_rot_step_size: 0.40   # was 0.78 (~45 deg, way too coarse for 5-DOF Lula CCD); 0.40 ~= 23 deg
+  opt_interpolate_pos_step_size: 0.02
   opt_interpolate_rot_step_size: 0.10
   max_collision_points: 60
   sampling_maxfun: 5000
@@ -93,7 +91,7 @@ subgoal_solver:
 
 keypoint_proposer:
   num_candidates_per_mask: 5
-  min_dist_bt_keypoints: 0.06
+  min_dist_bt_keypoints: 0.03
   max_mask_ratio: 0.5
   device: *device
   bounds_min: *bounds_min
@@ -101,7 +99,7 @@ keypoint_proposer:
   seed: *seed
 
 constraint_generator:
-  model: gpt-4o
+  model: gpt-4o-2024-11-20   # newer snapshot -> noticeably fewer logic errors when writing constraint funcs
   temperature: 0.0
   max_tokens: 2048
 
